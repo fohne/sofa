@@ -60,7 +60,7 @@ function install_python_packages()
 	    $WITH_SUDO python3.6 get-pip.py
         $WITH_SUDO rm get-pip.py
     elif [[ $(which apt) ]] ; then	
-        $WITH_SUDO apt install python3.6 python3-pip python3-dev -y
+        $WITH_SUDO apt install python3 python3-pip python3-dev -y
     else
 	    file_pytar="Python-3.6.0.tar.xz"
 	    wget https://www.python.org/ftp/python/3.6.0/$file_pytar
@@ -75,9 +75,9 @@ function install_python_packages()
     fi
     [[ $? != 0 ]] && echo -e "${C_RED_BK}Failed... :(${C_NONE}" && exit 1
     echo "Install via pip"
-    PIP_PACKAGES="numpy pandas scipy networkx cxxfilt fuzzywuzzy sqlalchemy sklearn python-Levenshtein"
-    python3.6 -m pip install --user --upgrade pip
-    python3.6 -m pip install --user --no-cache-dir ${PIP_PACKAGES}
+    PIP_PACKAGES="numpy pandas matplotlib grpcio scipy networkx cxxfilt fuzzywuzzy sqlalchemy sklearn python-Levenshtein"
+    python3 -m pip install --user --upgrade pip
+    python3 -m pip install --user --no-cache-dir ${PIP_PACKAGES}
     [[ $? != 0 ]] && echo -e "${C_RED_BK}Failed... :(${C_NONE}" && exit 1
 
     if [[ $(which /opt/conda/bin/python3.6) ]] ; then
@@ -99,7 +99,8 @@ function install_packages()
         $WITH_SUDO apt-get update --fix-missing
 	    $WITH_SUDO apt-get install -y curl wget make gcc g++ cmake \
             linux-tools-common tcpdump sysstat \
-            linux-tools-$(uname -r) linux-cloud-tools-$(uname -r) linux-tools-generic linux-cloud-tools-generic 
+            linux-tools-$(uname -r) linux-cloud-tools-$(uname -r) linux-tools-generic linux-cloud-tools-generic \
+            bpfcc-tools linux-headers-$(uname -r)
 	    [[ $? != 0 ]] && echo -e "${C_RED_BK}Failed... :(${C_NONE}" && exit 1
     elif [[ $(which yum) ]]  ; then
         $WITH_SUDO yum install -y epel-release 
@@ -115,11 +116,12 @@ function install_packages()
 function install_utility_from_source()
 {
     echo -e "${C_GREEN}Installing utilities from source...${C_NONE}"
-    make -C sofa-pcm -j4 
+    #make -C sofa-pcm -j4 
     [[ $? != 0 ]] && echo -e "${C_RED_BK}Failed... :(${C_NONE}" && exit 1
     nvcc tools/cuhello.cu -o ./bin/cuhello
     [[ $? != 0 ]] && echo -e "${C_YELLOW}No nvcc found; nvcc is required to improve perf timestamp accuracy.${C_NONE}" 
     g++  tools/sofa_perf_timebase.cc -o ./bin/sofa_perf_timebase
+    gcc  tools/real_mono_diff.c -o ./bin/real_mono_diff
     [[ $? != 0 ]] && echo -e "${C_RED_BK}Failed... :(${C_NONE}" && exit 1
     #rm -rf pcm
     #git clone https://github.com/opcm/pcm.git 
@@ -127,14 +129,15 @@ function install_utility_from_source()
     #cd pcm && make -j && cd - 
     #$WITH_SUDO mkdir -p /usr/local/intelpcm/bin 
     #$WITH_SUDO cp pcm/pcm-*.x /usr/local/intelpcm/bin 
-    rm -r papi
-    if [[ ! -f papi-5.6.0.tar.gz ]]; then  
-        wget http://icl.utk.edu/projects/papi/downloads/papi-5.6.0.tar.gz
-    fi
-    tar xvf papi-5.6.0.tar.gz
-    mv papi-5.6.0 papi
-    cd papi/src && ./configure --prefix=$(pwd)/build && make -j4 && make install && cd - 
-    rm papi-5.6.0.tar.gz
+    #
+    #rm -r papi
+    #if [[ ! -f papi-5.6.0.tar.gz ]]; then  
+    #    wget http://icl.utk.edu/projects/papi/downloads/papi-5.6.0.tar.gz
+    #fi
+    #tar xvf papi-5.6.0.tar.gz
+    #mv papi-5.6.0 papi
+    #cd papi/src && ./configure --prefix=$(pwd)/build && make -j4 && make install && cd - 
+    #rm papi-5.6.0.tar.gz
 }
 
 # main

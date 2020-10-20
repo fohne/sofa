@@ -1,24 +1,51 @@
-#!/usr/bin/env python3.6
-import pandas as pd
-import numpy as np
-import csv
-import json
-import sys
 import argparse
-import multiprocessing as mp
+import csv
 import glob
+import itertools
+import json
+import multiprocessing as mp
 import os
-from functools import partial
-import subprocess
 import re
-from sofa_config import *
-from sofa_print import *
-from random import *
-from sqlalchemy import create_engine
-from sklearn.cluster import KMeans
-import cxxfilt 
-from operator import itemgetter
+import datetime
+
+import subprocess
+import sys
 import warnings
+from functools import partial
+from operator import itemgetter
+
+import cxxfilt
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sqlalchemy import create_engine
+
+from sofa_config import *
+from sofa_ml import hsg_v1, hsg_v2, swarms_to_sofatrace
+from sofa_models import SOFATrace
+from sofa_print import *
+import random 
+
+from DDS.sofa_ds_preprocess import ds_dds_preprocess
+sofa_fieldnames = [
+    "timestamp",  # 0
+    "event",  # 1
+    "duration",  # 2
+    "deviceId",  # 3
+    "copyKind",  # 4
+    "payload",  # 5
+    "bandwidth",  # 6
+    "pkt_src",  # 7
+    "pkt_dst",  # 8
+    "pid",  # 9
+    "tid",  # 10
+    "name",  # 11
+    "category"] # 12
+
+def random_generate_color():
+        rand = lambda: random.randint(0, 255)
+        return '#%02X%02X%02X' % ( 200, 200, rand())
+
 
 def list_downsample(list_in, plot_ratio):
     new_list = []
@@ -28,17 +55,50 @@ def list_downsample(list_in, plot_ratio):
             new_list.append(list_in[i])
     return new_list
 
+def trace_init():
+    t_begin = 0 
+    deviceId = 0
+    metric = 0
+    event = -1
+    copyKind = -1
+    payload = -1
+    bandwidth = -1
+    pkt_src = pkt_dst = -1
+    pid = tid = -1
+    name = ''
+    category = 0
+
+    trace = [
+       t_begin,
+       event,
+       metric,
+       deviceId,
+       copyKind,
+       payload,
+       bandwidth,
+       pkt_src,
+       pkt_dst,
+       pid,
+       tid,
+       name,
+       category]
+    
+    return trace
 
 def list_to_csv_and_traces(logdir, _list, csvfile, _mode):
-    traces = pd.DataFrame(_list[1:])    
-    traces.columns = sofa_fieldnames
-    _header = True if _mode == 'w' else False
-    traces.to_csv(logdir +
-                  csvfile,
-                  mode=_mode,
-                  header=_header,
-                  index=False,
-                  float_format='%.6f')
+    traces = []
+    if len(_list[1:]) > 0:
+    	traces = pd.DataFrame(_list[1:])
+    	traces.columns = sofa_fieldnames
+    	_header = True if _mode == 'w' else False
+    	traces.to_csv(logdir +
+    	              csvfile,
+    	              mode=_mode,
+    	              header=_header,
+    	              index=False,
+    	              float_format='%.6f')
+    else:
+        print_warning('Empty list cannot be exported to %s!' % csvfile)
     return traces
 
 # 0/0     [004] 96050.733788:          1 bus-cycles:  ffffffff8106315a native_write_msr_safe
@@ -47,64 +107,42 @@ def list_to_csv_and_traces(logdir, _list, csvfile, _mode):
 # 359342/359342 2493492.850128:          1 cycles:  ffffffff8106450a
 # native_write_msr_safe
 
-def cpu_trace_read_hsg(sample, t_offset):
+def cpu_trace_read(sample, cfg, t_offset, cpu_mhz_xp, cpu_mhz_fp):
     fields = sample.split()
-
+    event = event_raw = 0
+    counts = 0
     if re.match('\[\d+\]', fields[1]) is not None:
         time = float(fields[2].split(':')[0])
-        func_name = '[%s]'%fields[4].replace('-','_') + fields[6] + fields[7] 
-        cycles = float(fields[3])
-        event = np.log(1.0 * int("0x01" + fields[5], 16))
-        # add column to cpu_traces
-        feature_types = fields[3].split(':')[0]
-    else:
-        time = float(fields[1].split(':')[0])
-        func_name = '[%s]'%fields[3].replace('-','_')  + fields[5] + fields[6] 
-        cycles = float(fields[2])
-        event = np.log(1.0 * int("0x01" + fields[4], 16))
-        # add column to cpu_traces
-        feature_types = fields[3].split(':')[0]        
-
-    t_begin = time + t_offset
-    t_end = time + t_offset
-
-    trace = [t_begin,                          # 0
-             event,  # % 1000000               # 1
-             cycles/1e9,                       # 2
-             -1,                               # 3
-             -1,                               # 4 
-             0,                                # 5
-             0,                                # 6
-             -1,                               # 7
-             -1,                               # 8
-             int(fields[0].split('/')[0]),     # 9
-             int(fields[0].split('/')[1]),     # 10
-             func_name,                        # 11
-             0,                                # 12
-             feature_types]                    # 13
-    return trace
-
-def cpu_trace_read(sample, t_offset):
-    fields = sample.split()
-
-    if re.match('\[\d+\]', fields[1]) is not None:
-        time = float(fields[2].split(':')[0])
-        func_name = '[%s]'%fields[4].replace('-','_') + fields[6] + fields[7] 
+        func_name = '[%s]'%fields[4].replace('-','_') + fields[6] + fields[7]
         counts = float(fields[3])
-        event = np.log(1.0 * int("0x01" + fields[5], 16))
+        event_raw = 1.0 * int("0x01" + fields[5], 16)
     else:
         time = float(fields[1].split(':')[0])
-        func_name = '[%s]'%fields[3].replace('-','_')  + fields[5] + fields[6] 
+        func_name = '[%s]'%fields[3].replace('-','_')  + fields[5] + fields[6]
         counts = float(fields[2])
-        event = np.log(1.0 * int("0x01" + fields[4], 16))
+        event_raw = 1.0 * int("0x01" + fields[4], 16)
+
+    if not cfg.absolute_timestamp:
+        time = time - cfg.time_base
 
     t_begin = time + t_offset
     t_end = time + t_offset
+
+    if len(cpu_mhz_xp) > 1:
+        duration = counts/(np.interp(t_begin, cpu_mhz_xp, cpu_mhz_fp)*1e6)
+    else:
+        duration = counts/(3000.0*1e6)
+
+    event  = np.log10(event_raw)
+
+    if cfg.perf_events.find('cycles') == -1:
+        duration = np.log2(event_raw/1e14)
+
     trace = [t_begin,                          # 0
              event,  # % 1000000               # 1
-             1.0*counts/1e9,                   # 2
+             duration,                         # 2
              -1,                               # 3
-             -1,                               # 4 
+             -1,                               # 4
              0,                                # 5
              0,                                # 6
              -1,                               # 7
@@ -115,24 +153,38 @@ def cpu_trace_read(sample, t_offset):
              0]                                # 12
     return trace
 
-
-def net_trace_read(packet, t_offset):
-    time = float(packet.split()[0])
+def net_trace_read(packet, cfg, t_offset):
+    #21234 1562233011.469681 IP 192.168.88.88.56828 > 224.224.255.255.5400: UDP, length 851
+    #21235 1562233011.471352 IP 10.57.185.172.8554 > 192.168.88.88.53528: tcp 0
+    fields = packet.split()
+    time = float(fields[0])
+    
+    if not cfg.absolute_timestamp:
+        time = time - cfg.time_base
+    
     t_begin = time + t_offset
     t_end = time + t_offset
-    if packet.split()[1] != 'IP':
+    if fields[1] != 'IP':
         return []
-    payload = int(packet.split()[6])
-    duration = float(payload / 125.0e6)
-    bandwidth = 125.0e6
+
+    protocol = fields[5]
+    if protocol == 'UDP,': 
+        payload = int(fields[7])
+    elif protocol == 'tcp': 
+        payload = int(fields[6])
+    else:
+        return [] 
+
+    duration = float(payload / 128.0e6)
+    bandwidth = 128.0e6
     pkt_src = 0
     pkt_dst = 0
     for i in range(4):
         pkt_src = pkt_src + \
-            int(packet.split()[2].split('.')[i]) * np.power(1000, 3 - i)
+            int(fields[2].split('.')[i]) * np.power(1000, 3 - i)
         pkt_dst = pkt_dst + \
-            int(packet.split()[4].split('.')[i]) * np.power(1000, 3 - i)
-    trace = [	t_begin,
+            int(fields[4].split('.')[i]) * np.power(1000, 3 - i)
+    trace = [ t_begin,
               payload * 100 + 17,
               duration,
               -1,
@@ -143,13 +195,14 @@ def net_trace_read(packet, t_offset):
               pkt_dst,
               -1,
               -1,
-              "network:tcp:%d_to_%d_with_%d" % (pkt_src, pkt_dst, payload),
+              "network:%s:%d_to_%d_with_%d" % (protocol, pkt_src, pkt_dst, payload),
               0
               ]
     return trace
 
 def cuda_api_trace_read(
         record,
+        cfg,
         indices,
         n_cudaproc,
         ts_rescale,
@@ -161,13 +214,17 @@ def cuda_api_trace_read(
 
     # print("kernel name = %s" % kernel_name)
     time = float(values[indices.index('Start')]) / ts_rescale + t_offset
+
+    if not cfg.absolute_timestamp:
+        time = time - cfg.time_base
+
     duration = float(values[indices.index('Duration')]) / dt_rescale
     t_begin = time
     t_end = time + duration
     payload = 0
     bandwidth = 0
     pid = n_cudaproc
-    deviceId = -1 
+    deviceId = -1
     tid = stream_id = -1
     pkt_src = pkt_dst = copyKind = 0
 
@@ -189,12 +246,9 @@ def cuda_api_trace_read(
              0]
     return trace
 
-
-
-
-
 def gpu_trace_read(
         record,
+        cfg, 
         indices,
         n_cudaproc,
         ts_rescale,
@@ -204,8 +258,11 @@ def gpu_trace_read(
     values = record.replace('"', '').split(',')
     kernel_name = values[indices.index('Name')]
 
-    # print("kernel name = %s" % kernel_name)
     time = float(values[indices.index('Start')]) / ts_rescale + t_offset
+    
+    if not cfg.absolute_timestamp:
+        time = time - cfg.time_base
+    
     duration = float(values[indices.index('Duration')]) / dt_rescale
     t_begin = time
     t_end = time + duration
@@ -221,7 +278,7 @@ def gpu_trace_read(
 
     pid = n_cudaproc
 
-    deviceId = -1 
+    deviceId = -1
     try:
         deviceId = int(float(values[indices.index('Context')]))
     except BaseException:
@@ -238,17 +295,17 @@ def gpu_trace_read(
         copyKind = 1
         pkt_src = 0
         pkt_dst = deviceId
-        kernel_name = "copyKind_%d_%dB" % (copyKind, payload)
+        kernel_name = "CUDA_COPY_H2D_%dB" % (payload)
     elif kernel_name.find('DtoH') != -1:
         copyKind = 2
         pkt_src = deviceId
         pkt_dst = 0
-        kernel_name = "copyKind_%d_%dB" % (copyKind, payload)
+        kernel_name = "CUDA_COPY_D2H_%dB" % (payload)
     elif kernel_name.find('DtoD') != -1:
         copyKind = 8
         pkt_src = deviceId
         pkt_dst = deviceId
-        kernel_name = "copyKind_%d_%dB" % (copyKind, payload)
+        kernel_name = "CUDA_COPY_D2D_%dB" % (payload)
     elif kernel_name.find('PtoP') != -1:
         copyKind = 10
         try:
@@ -261,15 +318,13 @@ def gpu_trace_read(
         except BaseException:
             pkt_dst = 0
 
-        kernel_name = "copyKind_%d_from_gpu%d_to_gpu%d_%dB" % (copyKind, pkt_src, pkt_dst, payload)
+        kernel_name = "[CUDA_COPY_P2P]from_gpu%d_to_gpu%d_%dB" % (pkt_src, pkt_dst, payload)
     else:
         copyKind = 0
 
     if deviceId != -1:
         kernel_name = '[gpu%d]'%deviceId + kernel_name
-    # print("%d:%d [%s] ck:%d, %lf,%lf: %d -> %d: payload:%d, bandwidth:%lf,
-    # duration:%lf "%(deviceId, streamId, kernel_name, copyKind,
-    # t_begin,t_end, pkt_src, pkt_dst, payload, bandwidth, duration))
+    
     trace = [t_begin,
              payload * 100 + 17,
              duration,
@@ -286,126 +341,7 @@ def gpu_trace_read(
     return trace
 
 
-def gpu_kernel_trace_read(record, pid, t_base, t_glb_base):
-    t_begin = (record[0] - t_base) / 1e9 + t_glb_base
-    t_end = (record[1] - t_base) / 1e9 + t_glb_base
-    kernel_name = "%s" % (
-        gpu_symbol_table.loc[gpu_symbol_table._id_ == record[2], 'value'])
-    kernel_name = kernel_name[:-30]
-    trace = [	t_begin,
-              record[2],
-              float(t_end - t_begin),
-              record[4],
-              -1,
-              0,
-              0.0,
-              -1,
-              -1,
-              pid,
-              record[3],
-              kernel_name,
-              0]
-    return trace
-
-
-def gpu_memcpy_trace_read(record, t_base, t_glb_base):
-    t_begin = (record[0] - t_base) / 1e9 + t_glb_base
-    t_end = (record[1] - t_base) / 1e9 + t_glb_base
-
-    src = -1
-    dst = -1
-    if record[3] == 1:
-        src = 0
-        dst = record[4] + 1
-    elif record[3] == 2:
-        src = record[4] + 1
-        dst = 0
-    elif record[3] == 8:
-        src = record[4] + 1
-        dst = record[4] + 1
-
-    trace = [	t_begin,
-              record[2],
-              float(t_end - t_begin),
-              record[4],
-              record[3],
-              record[2],
-              float(record[2]) / (t_end - t_begin) / 1.0e6,
-              src,
-              dst,
-              record[7],  # streamId
-              -1,
-              "gpu%d_copyKind%d_%dB" % (record[4], record[3], record[2]),
-              0]
-    return trace
-
-
-def gpu_memcpy2_trace_read(record, t_base, t_glb_base):
-    t_begin = (record[0] - t_base) / 1e9 + t_glb_base
-    t_end = (record[1] - t_base) / 1e9 + t_glb_base
-    trace = [	t_begin,
-              record[2],
-              float(t_end - t_begin),
-              record[4],
-              record[3],
-              record[2],
-              float(record[2]) / (t_end - t_begin) / 1.0e6,
-              record[8],
-              record[9],
-              record[7],  # streamId
-              -1,
-              "gpu%d_copyKind%d_%dB" % (record[4], record[3], record[2]),
-              0]
-    return trace
-
-
-class bcolors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-
-
-def print_warning(content):
-    print((bcolors.WARNING + "[WARNING] " + content + bcolors.ENDC))
-
-
-def print_info(content):
-    print((bcolors.OKGREEN + "[INFO] " + content + bcolors.ENDC))
-
-
-def print_progress(content):
-    print((bcolors.OKBLUE + "[PROGRESS] " + content + bcolors.ENDC))
-
-
-class SOFATrace:
-    data = []
-    name = []
-    title = []
-    color = []
-    x_field = []
-    y_field = []
-
-# traces_to_json()
-#    Please set "turboThreshold:0" in PlotOptions of ScatterChart to unlimit number of points
-#    series: [{
-#        name: 'Female',
-#        color: 'rgba(223, 83, 83, .5)',
-#        data: [{x:161.2, y:51.6, name:'b'}, {x:167.5, y:59.0, name:"a"}]
-#    },
-#    {
-#        name: 'Male',
-#        color: 'rgba(23, 83, 183, .5)',
-#        data: [{x:16.2, y:151.6, name:'bd'}, {x:67.5, y:59.0, name:"ad"}]
-#    }
-#    ]
-
-
-def traces_to_json(traces, path, cfg):
+def traces_to_json(traces, path, cfg, pid):
     if len(traces) == 0:
         print_warning("Empty traces!")
         return
@@ -431,72 +367,71 @@ def traces_to_json(traces, path, cfg):
                         'y': trace.y_field},
                     inplace=True)
             f.write("\n\n")
+        if cfg.ds:
+            f.write("sofa_traces%s = [ "%pid)
 
-        f.write("sofa_traces = [ ")
+        else:
+            f.write("sofa_traces = [ ")
         for trace in traces:
             if len(trace.data) > 0:
                 f.write(trace.name + ",")
+        if cfg.ds:
+            pass
+            #f.write("hl%s"%pid)
+
         f.write(" ]")
 
-def random_generate_color():
-        rand = lambda: randint(0, 255)
-        return '#%02X%02X%02X' % (rand(), rand(), rand())
-
-def kmeans_cluster(num_of_cluster, X):
-    '''
-    num_of_cluster: how many groups of data you prefer
-    X: input taining data    
-    '''
-    random_state = 170
-    try:
-        num_of_cluster = 5
-        y_pred = KMeans(n_clusters=num_of_cluster, random_state=random_state).fit_predict(X)                
-    except :
-        num_of_cluster = len(X) # minimum number of data
-        y_pred = KMeans(n_clusters=num_of_cluster, random_state=random_state).fit_predict(X)  
-    
-    return y_pred
-
-sofa_fieldnames = [
-    "timestamp",  # 0
-    "event",  # 1
-    "duration",  # 2
-    "deviceId",  # 3
-    "copyKind",  # 4
-    "payload",  # 5
-    "bandwidth",  # 6
-    "pkt_src",  # 7
-    "pkt_dst",  # 8
-    "pid",  # 9
-    "tid",  # 10
-    "name",  # 11
-    "category"] # 12
-
-
-def sofa_preprocess(logdir, cfg):
-    t_glb_base = 0
+def sofa_preprocess(cfg):
+    cfg.time_base = 0
     t_glb_gpu_base = 0
+    logdir = cfg.logdir
 
-    with open(logdir + 'perf.script', 'w') as logfile:
-        subprocess.call(['perf',
-                         'script',
-                         '--kallsym',
-                         '%s/kallsyms' % logdir,
-                         '-i',
-                         '%s/perf.data' % logdir,
-                         '-F',
-                         'time,pid,tid,event,ip,sym,dso,symoff,period,brstack,brstacksym'],
-                        stdout=logfile)
-    
+    with open(logdir + 'misc.txt', 'r') as f:
+        lines = f.readlines()
+        if len(lines) == 4:
+            cfg.pid = int(lines[3].split()[1])
+        else:
+            print_warning('Incorrect misc.txt content. Some profiling information may not be available.')
+
+    if int(os.system('command -v perf 1> /dev/null')) == 0:
+        with open(logdir + 'perf.script', 'w') as logfile:
+            subprocess.call(['perf',
+                             'script',
+                             '--kallsym',
+                             '%s/kallsyms' % logdir,
+                             '-i',
+                             '%s/perf.data' % logdir,
+                             '-F',
+                             'time,pid,tid,event,ip,sym,dso,symoff,period,brstack,brstacksym'],
+                            stdout=logfile)
+
     with open(logdir + 'sofa_time.txt') as f:
-        lines = f.readlines() 
-        t_glb_base = float(lines[0]) + cfg.cpu_time_offset
-        print_info('Time offset applied to timestamp (s):' + str(cfg.cpu_time_offset))
-        print_info('SOFA global time base (s):' + str(t_glb_base))
-    
+
+        lines = f.readlines()
+        cfg.time_base = float(lines[0]) + cfg.cpu_time_offset
+        print_info(cfg,'Time offset applied to timestamp (s):' + str(cfg.cpu_time_offset))
+        print_info(cfg,'SOFA global time base (s):' + str(cfg.time_base))
+
+    cpu_mhz_xp = [0.0]
+    cpu_mhz_fp = [3000.0]
+    #np.interp(2.5, xp, fp)
+    try:
+        with open(logdir + 'cpuinfo.txt') as f:
+            lines = f.readlines()
+            for line in lines:
+                fields = line.split()
+                timestamp = float(fields[0])
+                mhz = float(fields[1])
+                cpu_mhz_xp.append(timestamp)
+                cpu_mhz_fp.append(mhz)
+    except:
+        print_warning('no cpuinfo file is found, default cpu MHz = %lf'%(fp[0]))
+
     net_traces = []
     cpu_traces = []
     cpu_traces_viz = []
+    blk_d_traces = []
+    blk_traces = []
     vm_usr_traces = []
     vm_sys_traces = []
     vm_bi_traces = []
@@ -505,8 +440,16 @@ def sofa_preprocess(logdir, cfg):
     vm_cs_traces = []
     vm_wa_traces = []
     vm_st_traces = []
+    mpstat_traces = []
+    diskstat_traces = []
+    tx_traces = []
+    rx_traces = []
+    strace_traces = []
+    pystacks_traces = []
     nvsmi_sm_traces = []
     nvsmi_mem_traces = []
+    nvsmi_enc_traces = []
+    nvsmi_dec_traces = []
     pcm_pcie_traces = []
     pcm_core_traces = []
     pcm_memory_traces = []
@@ -526,10 +469,261 @@ def sofa_preprocess(logdir, cfg):
     gpu_glb_memcpy_h2d_traces = []
     gpu_glb_memcpy_d2h_traces = []
     gpu_glb_memcpy_d2d_traces = []
+    ds_traces = []
 
     gpulog_mode = 'w'
     gpulog_header = 'True'
     cpu_count = mp.cpu_count()
+
+    with open('%s/mpstat.txt' % logdir) as f:
+        mpstat = np.genfromtxt(logdir+'/mpstat.txt', delimiter=',', invalid_raise=False )
+        header = mpstat[0]
+        mpstat = mpstat[1:]
+        mpstat_list = []
+        mpstat_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
+        n_cores = int(mpstat[:,1].max() + 1)
+        stride = n_cores + 1
+        for i in range(len(mpstat)):
+            if len(mpstat[i]) < len(header):
+                continue
+            if i <= stride or mpstat[i,1] == -1:
+                continue
+            #time, cpu,  user，nice, system, idle, iowait, irq, softirq
+            core = mpstat[i,1]
+            d_mp = mpstat[i,:] - mpstat[i-stride,:]
+            d_mp_total = d_mp[2] + d_mp[4] + d_mp[5] + d_mp[6] + d_mp[7]
+            if d_mp_total == 0 :
+                print_info(cfg, 'No increases in mpstat values')
+                continue
+            d_mp_usr = d_mp[2] * 100 / float(d_mp_total)
+            d_mp_sys = d_mp[4] * 100 / float(d_mp_total)
+            d_mp_idl = d_mp[5] * 100 / float(d_mp_total)
+            d_mp_iow = d_mp[6] * 100 / float(d_mp_total)
+            d_mp_irq = d_mp[7] * 100 / float(d_mp_total)
+            cpu_time = (d_mp_total - d_mp[5]) * 0.01
+            t_begin = mpstat[i,0]
+
+            if not cfg.absolute_timestamp:
+                t_begin = t_begin - cfg.time_base
+
+            deviceId = core
+            metric = cpu_time
+            event = -1
+            copyKind = -1
+            payload = -1
+            bandwidth = -1
+            pkt_src = pkt_dst = -1
+            pid = tid = -1
+            mpstat_info = 'mpstat_core%d (usr|sys|idl|iow|irq): |%3d|%3d|%3d|%3d|%3d|' % (core, d_mp_usr, d_mp_sys, d_mp_idl, d_mp_iow, d_mp_irq)
+
+            trace_usr = [
+                t_begin,
+                event,
+                metric,
+                deviceId,
+                copyKind,
+                payload,
+                bandwidth,
+                pkt_src,
+                pkt_dst,
+                pid,
+                tid,
+                mpstat_info,
+                0]
+            
+            mpstat_list.append(trace_usr)
+            
+        mpstat_traces = list_to_csv_and_traces(logdir, mpstat_list, 'mpstat.csv', 'w')
+
+#==============================================================================
+    ds_pid = -1
+
+    if cfg.ds:
+        # ds global variables declaration for later raw data processing
+        with open(logdir + 'pid.txt') as pidfd:
+            ds_pid = int(pidfd.readline())
+            ds_dds_traces = ds_dds_preprocess(cfg, logdir, ds_pid)
+#==============================================================================
+    with open('%s/diskstat.txt' % logdir) as f:
+        diskstats = f.readlines()
+        diskstat_list = []
+        diskstat_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
+        tmp_list = []
+        for diskstat in diskstats:
+            m = diskstat[:-1]
+            m = m.split(',')
+            tmp_list.append(m)
+        devs = list(map(lambda x: x[1], tmp_list))
+        n_dev = len(set(devs)) 
+
+        for i in range(len(diskstats)):
+            if i < n_dev:
+                continue
+            m = diskstats[i][:-1]
+            m = m.split(',')
+            dev = m[1]
+            m_last = diskstats[i-n_dev][:-1]
+            m_last = m_last.split(',')
+            secsize=0
+            # get sector size
+            try:
+                f = open('/sys/block/'+dev+'/queue/hw_sector_size')
+                s = f.readline()
+                s = re.match("\d+", s)
+                secsize = int(s.group())
+            except:
+                pass
+
+            d_read = int(m[2]) - int(m_last[2])
+            d_read *= secsize
+            d_write = int(m[3]) - int(m_last[3])
+            d_write *= secsize
+            d_disk_total = d_read + d_write #total bytes
+            
+            if not d_disk_total:
+                continue
+            t_begin = float(m_last[0])
+
+            if not cfg.absolute_timestamp:
+                t_begin = t_begin - cfg.time_base     
+            
+            d_duration = float(m[0]) - float(m_last[0])
+
+            # MB/s
+            d_throughput = round((d_disk_total/d_duration)/float(1024 ** 2),2)
+
+            event = -1
+            duration = d_duration
+            deviceId = m[1]
+            copyKind = -1
+            payload = d_disk_total
+            bandwidth = d_throughput
+            pkt_src = -1
+            pkt_dst = -1
+            pid = -1
+            tid = -1
+            diskstat_info = 'diskstat_dev:%s (read|write): |%3d|%3d| bytes' % (m[1], d_read, d_write)
+            trace = [
+                t_begin,
+                event,
+                duration,
+                deviceId,
+                copyKind,
+                payload,
+                bandwidth,
+                pkt_src,
+                pkt_dst,
+                pid,
+                tid,
+                diskstat_info,
+                0]
+
+            diskstat_list.append(trace)
+        diskstat_traces = list_to_csv_and_traces(logdir, diskstat_list, 'diskstat.csv', 'w')
+
+    
+    #     dev   cpu   sequence  timestamp   pid  event operation start_block+number_of_blocks   process
+    # <mjr,mnr>        number
+    #     8,0    6        1     0.000000000 31479  A   W 691248304 + 1024 <- (8,5) 188175536
+    #     8,0    6        2     0.000001254 31479  Q   W 691248304 + 1024 [dd]
+    #     8,0    6        3     0.000003353 31479  G   W 691248304 + 1024 [dd]
+    #     8,0    6        4     0.000005004 31479  I   W 691248304 + 1024 [dd]
+    #     8,0    6        5     0.000006175 31479  D   W 691248304 + 1024 [dd]
+    #     8,0    2        1     0.001041752     0  C   W 691248304 + 1024 [0]
+    if cfg.blktrace_device is not None:
+        with open('%s/blktrace.txt' % logdir) as f:
+            lines = f.readlines()
+            print_info(cfg,"Length of blktrace = %d" % len(lines))
+            if len(lines) > 0:
+                blktrace_d_list = []
+                blktrace_list = []
+                blktrace_d_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
+                blktrace_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
+                record_error_flag = 0
+
+                t = 0
+                for i in range(len(lines)):
+                    # filter some total calculate information in the below of blktrace.txt file
+                    if len(lines[i]) > 50 and "Read" not in lines[i] and "CPU" not in lines[i] and "IO unplugs" not in lines[i]:
+                        fields = lines[i].split()
+                        blktrace_dev = fields[0]
+                        blktrace_cpu = fields[1]
+                        blktrace_sequence_number = fields[2]
+                        blktrace_timestamp = float(fields[3])
+                        blktrace_pid = fields[4]
+                        blktrace_event = fields[5]
+                        blktrace_operation = fields[6]
+                        try: 
+                            blktrace_start_block = int(fields[7])
+                        except:
+                            blktrace_start_block = 0
+                            record_error_flag = 1
+                            pass
+                        # the two column blktrace_block_size and blktrace_process is for future used
+                        if len(fields) > 10:
+                            blktrace_block_size = fields[9]
+                            blktrace_process = fields[10]
+
+                        t_begin = blktrace_timestamp
+                        deviceId = cpuid = blktrace_cpu
+                        event = blktrace_event
+                        copyKind = -1
+                        payload = -1
+                        bandwidth = -1
+                        pkt_src = pkt_dst = -1
+                        pid = tid = blktrace_pid
+                        name_info = 'starting_block='+str(blktrace_start_block)
+                        trace = [
+                            t_begin,
+                            event,
+                            blktrace_start_block,
+                            deviceId,
+                            copyKind,
+                            payload,
+                            bandwidth,
+                            pkt_src,
+                            pkt_dst,
+                            pid,
+                            tid,
+                            name_info,
+                            cpuid]
+
+                        if 'D' is event:
+                            blktrace_d_list.append(trace)
+
+                        if 'C' is event:
+                            for i in range(len(blktrace_d_list)):
+                                if i==0:
+                                    continue
+                                if int(blktrace_d_list[i][2])==int(blktrace_start_block):
+                                    time_consume = float(blktrace_timestamp)-float(blktrace_d_list[i][0])
+                                    # print('blktrace_d_list[i]:%s'%blktrace_d_list[i])
+                                    # print('int(blktrace_timestamp):%f, int(blktrace_d_list[i][0]:%f, time_consume:%f' % (float(blktrace_timestamp), float(blktrace_d_list[i][0]), time_consume))
+                                    trace = [
+                                        blktrace_d_list[i][0],
+                                        event,
+                                        float(time_consume),
+                                        deviceId,
+                                        copyKind,
+                                        payload,
+                                        bandwidth,
+                                        pkt_src,
+                                        pkt_dst,
+                                        pid,
+                                        tid,
+                                        name_info,
+                                        cpuid]
+                                    blktrace_list.append(trace)
+                                    blktrace_d_list[i][11] = 'latency=%0.6f' % float(time_consume)
+
+                blk_d_traces = list_to_csv_and_traces(
+                    logdir, blktrace_d_list, 'blktrace.csv', 'w')
+                blk_traces = list_to_csv_and_traces(
+                    logdir, blktrace_list, 'blktrace.csv', 'a')
+
+                if record_error_flag == 1 :
+                    print_warning('blktrace maybe record failed!')
+
 
     # procs -----------------------memory---------------------- ---swap-- -
     #  r  b         swpd         free         buff        cache   si   so    bi    bo   in   cs  us  sy  id  wa  st
@@ -537,7 +731,7 @@ def sofa_preprocess(logdir, cfg):
     # ============ Preprocessing VMSTAT Trace ==========================
     with open('%s/vmstat.txt' % logdir) as f:
         lines = f.readlines()
-        print_info("Length of vmstat_traces = %d" % len(lines))
+        print_info(cfg,"Length of vmstat_traces = %d" % len(lines))
         if len(lines) > 0:
             vm_usr_list = []
             vm_sys_list = []
@@ -556,6 +750,13 @@ def sofa_preprocess(logdir, cfg):
             vm_wa_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
             vm_st_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
             t = 0
+            t_begin = 0
+
+            if not cfg.absolute_timestamp:
+                t_begin = t - cfg.cpu_time_offset
+            else:
+                t_begin = t_begin + t
+
             for i in range(len(lines)):
                 if lines[i].find('procs') == - \
                         1 and lines[i].find('swpd') == -1:
@@ -580,7 +781,8 @@ def sofa_preprocess(logdir, cfg):
                     vm_wa = float(fields[15]) + 1e-5
                     vm_st = float(fields[16]) + 1e-5
 
-                    t_begin = t + t_glb_base
+                    
+                    
                     deviceId = cpuid = -1
                     event = -1
                     copyKind = -1
@@ -734,24 +936,106 @@ def sofa_preprocess(logdir, cfg):
                         cpuid]
                     vm_sys_list.append(trace)
 
-                    t = t + 1
+                    t_begin = t_begin + 1
 
             vm_bi_traces = list_to_csv_and_traces(
-                logdir, vm_bi_list, 'vmstat_trace.csv', 'w')
+                logdir, vm_bi_list, 'vmstat.csv', 'w')
             vm_bo_traces = list_to_csv_and_traces(
-                logdir, vm_bo_list, 'vmstat_trace.csv', 'a')
+                logdir, vm_bo_list, 'vmstat.csv', 'a')
             vm_in_traces = list_to_csv_and_traces(
-                logdir, vm_in_list, 'vmstat_trace.csv', 'a')
+                logdir, vm_in_list, 'vmstat.csv', 'a')
             vm_cs_traces = list_to_csv_and_traces(
-                logdir, vm_cs_list, 'vmstat_trace.csv', 'a')
+                logdir, vm_cs_list, 'vmstat.csv', 'a')
             vm_wa_traces = list_to_csv_and_traces(
-                logdir, vm_wa_list, 'vmstat_trace.csv', 'a')
+                logdir, vm_wa_list, 'vmstat.csv', 'a')
             vm_st_traces = list_to_csv_and_traces(
-                logdir, vm_st_list, 'vmstat_trace.csv', 'a')
+                logdir, vm_st_list, 'vmstat.csv', 'a')
             vm_usr_traces = list_to_csv_and_traces(
-                logdir, vm_usr_list, 'vmstat_trace.csv', 'a')
+                logdir, vm_usr_list, 'vmstat.csv', 'a')
             vm_sys_traces = list_to_csv_and_traces(
-                logdir, vm_sys_list, 'vmstat_trace.csv', 'a')
+                logdir, vm_sys_list, 'vmstat.csv', 'a')
+
+    
+    # timestamp, name, index, utilization.gpu [%], utilization.memory [%]
+    # 2019/05/16 16:49:04.650, GeForce 940MX, 0, 0 %, 0 %
+    if os.path.isfile('%s/nvsmi_query.txt' % logdir):
+        with open('%s/nvsmi_query.txt' % logdir) as f:
+            next(f)
+            lines = f.readlines()
+            nvsmi_query_has_data = True
+            for line in lines:
+                if line.find('failed') != -1 or line.find('Failed') != -1:
+                    nvsmi_query_has_data = False
+                    print_warning('No nvsmi query data.')
+                    break
+            if nvsmi_query_has_data:
+                print_info(cfg,"Length of nvsmi_query_traces = %d" % len(lines))
+                nvsmi_sm_list = []
+                nvsmi_mem_list = []
+                nvsmi_sm_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
+                nvsmi_mem_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
+
+                for i in range(len(lines)):                 
+                    fields = lines[i].split(',')
+                    nv_time = fields[0]
+                    nv_time = datetime.datetime.strptime(nv_time, '%Y/%m/%d %H:%M:%S.%f').timestamp() + cfg.nvsmi_time_zone * 3600
+                    nvsmi_id = int(fields[2])
+                    nvsmi_sm = int(fields[3][:-2])
+                    nvsmi_mem = int(fields[4][:-2])
+                    
+                    # nvtime 
+                    t_begin = nv_time
+                    if not cfg.absolute_timestamp:
+                        t_begin = t_begin - cfg.time_base
+     
+                    deviceId = cpuid = nvsmi_id
+                    event = -1
+                    copyKind = -1
+                    payload = -1
+                    bandwidth = -1
+                    pkt_src = pkt_dst = -1
+                    pid = tid = -1
+                    sm_info = "GPUID_sm=%d_%d" % (nvsmi_id, nvsmi_sm)
+                    mem_info = "GPUID_mem=%d_%d" % (nvsmi_id, nvsmi_mem)
+
+                    trace = [
+                        t_begin,
+                        0,
+                        nvsmi_sm,
+                        deviceId,
+                        copyKind,
+                        payload,
+                        bandwidth,
+                        pkt_src,
+                        pkt_dst,
+                        pid,
+                        tid,
+                        sm_info,
+                        cpuid]
+                
+                    nvsmi_sm_list.append(trace)
+
+                    trace = [
+                        t_begin,
+                        1,
+                        nvsmi_mem,
+                        deviceId,
+                        copyKind,
+                        payload,
+                        bandwidth,
+                        pkt_src,
+                        pkt_dst,
+                        pid,
+                        tid,
+                        mem_info,
+                        cpuid]
+                    
+                    nvsmi_mem_list.append(trace)
+                    
+                if len(nvsmi_sm_list)>1:
+                    nvsmi_sm_traces = list_to_csv_and_traces(logdir, nvsmi_sm_list, 'nvsmi_trace.csv', 'w')
+                    nvsmi_mem_traces = list_to_csv_and_traces(logdir, nvsmi_mem_list, 'nvsmi_trace.csv', 'a')
+
 
     # gpu    sm   mem   enc   dec
     # Idx     %     %     %     %
@@ -761,12 +1045,18 @@ def sofa_preprocess(logdir, cfg):
     if os.path.isfile('%s/nvsmi.txt' % logdir):
         with open('%s/nvsmi.txt' % logdir) as f:
             lines = f.readlines()
-            print_info("Length of nvsmi_traces = %d" % len(lines))
-            if len(lines) > 0 and lines[0].find('failed')==-1:
-                nvsmi_sm_list = []
-                nvsmi_mem_list = []
-                nvsmi_sm_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
-                nvsmi_mem_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
+            nvsmi_has_data = True
+            for line in lines:
+                if line.find('failed') != -1 or line.find('Failed') != -1:
+                    nvsmi_has_data = False
+                    print_warning('No nvsmi data.')
+                    break
+            if nvsmi_has_data:
+                print_info(cfg,"Length of nvsmi_traces = %d" % len(lines))
+                nvsmi_enc_list = []
+                nvsmi_dec_list = []
+                nvsmi_enc_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
+                nvsmi_dec_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
                 t = 0
                 for i in range(len(lines)):
                     if lines[i].find('gpu') == -1 and lines[i].find('Idx') == -1:
@@ -774,10 +1064,19 @@ def sofa_preprocess(logdir, cfg):
                         if len(fields) < 5:
                             continue
                         nvsmi_id = int(fields[0])
-                        nvsmi_sm = float(fields[1]) + 1e-5
-                        nvsmi_mem = float(fields[2]) + 1e-5
+                        if fields[3] == '-':
+                            nvsmi_enc = int(0) 
+                        else:
+                            nvsmi_enc = int(fields[3])
+                        if fields[4] == '-':
+                            nvsmi_dec = int(0) 
+                        else:
+                            nvsmi_dec = int(fields[4]) 
 
-                        t_begin = t + t_glb_base
+                        if cfg.absolute_timestamp: 
+                            t_begin = t + cfg.time_base
+                        else:
+                            t_begin = t
                         deviceId = cpuid = nvsmi_id
                         event = -1
                         copyKind = -1
@@ -785,13 +1084,13 @@ def sofa_preprocess(logdir, cfg):
                         bandwidth = -1
                         pkt_src = pkt_dst = -1
                         pid = tid = -1
-                        nvsmi_info = "GPUID_sm_mem=%d_%lf_%lf" % (
-                            nvsmi_id, nvsmi_sm, nvsmi_mem)
+                        enc_info = "GPUID_enc=%d_%d" % (nvsmi_id, nvsmi_enc)
+                        dec_info = "GPUID_dec=%d_%d" % (nvsmi_id, nvsmi_dec)
 
                         trace = [
                             t_begin,
-                            event,
-                            nvsmi_sm,
+                            2,
+                            nvsmi_enc,
                             deviceId,
                             copyKind,
                             payload,
@@ -800,15 +1099,15 @@ def sofa_preprocess(logdir, cfg):
                             pkt_dst,
                             pid,
                             tid,
-                            nvsmi_info,
+                            enc_info,
                             cpuid]
                         if t > 3 :
-                            nvsmi_sm_list.append(trace)
+                            nvsmi_enc_list.append(trace)
 
                         trace = [
                             t_begin,
-                            event,
-                            nvsmi_mem,
+                            3,
+                            nvsmi_dec,
                             deviceId,
                             copyKind,
                             payload,
@@ -817,64 +1116,172 @@ def sofa_preprocess(logdir, cfg):
                             pkt_dst,
                             pid,
                             tid,
-                            nvsmi_info,
+                            dec_info,
                             cpuid]
                         if t > 3 :
-                            nvsmi_mem_list.append(trace)
+                            nvsmi_dec_list.append(trace)
+                        
                         if nvsmi_id == 0:
                             t = t + 1
-                if len(nvsmi_sm_list)>1:
-                    nvsmi_sm_traces = list_to_csv_and_traces(logdir, nvsmi_sm_list, 'nvsmi_trace.csv', 'w')
-                    nvsmi_mem_traces = list_to_csv_and_traces(logdir, nvsmi_mem_list, 'nvsmi_trace.csv', 'a')
+                if len(nvsmi_enc_list)>1:
+                    cfg.nvsmi_data = True
+                    nvsmi_enc_traces = list_to_csv_and_traces(logdir, nvsmi_enc_list, 'nvsmi_trace.csv', 'a')
+                    nvsmi_dec_traces = list_to_csv_and_traces(logdir, nvsmi_dec_list, 'nvsmi_trace.csv', 'a')
+                else:
+                    print_warning("Program exectution time is fewer than 3 seconds, so nvsmi trace analysis will not be displayed.")
 
     # ============ Preprocessing Network Trace ==========================
-    filtered_net_groups = []
+    
     if os.path.isfile('%s/sofa.pcap' % logdir):
         with open(logdir + 'net.tmp', 'w') as f:
             subprocess.check_call(
                 ["tcpdump", "-q", "-n", "-tt", "-r",
-                "%s/sofa.pcap"%logdir ], stdout=f)
+                "%s/sofa.pcap"%logdir ], stdout=f, stderr=subprocess.DEVNULL)
         with open(logdir + 'net.tmp') as f:
             packets = lines = f.readlines()
-            print_info("Length of net_traces = %d" % len(packets))
+            print_info(cfg,"Length of net_traces = %d" % len(packets))
             if packets:
                 with mp.Pool(processes=cpu_count) as pool:
                     res = pool.map(
                         partial(
                             net_trace_read,
+                            cfg=cfg,
                             t_offset=0),
                         packets)
                 res_viz = list_downsample(res, cfg.plot_ratio)
                 net_traces = pd.DataFrame(res_viz)
                 net_traces.columns = sofa_fieldnames
                 net_traces.to_csv(
-                    logdir + 'cputrace.csv',
-                    mode='a',
-                    header=False,
+                    logdir + 'nettrace.csv',
+                    mode='w',
+                    header=True,
                     index=False,
                     float_format='%.6f')
-    
+
                 # ============ Apply for Network filter =====================
                 if cfg.net_filters:
+                    filtered_net_groups = []
                     packet_not_zero = net_traces['payload'] > 0
                     start = (net_traces['pkt_src'] == float(cfg.net_filters[0]))
                     for filter in cfg.net_filters[1:]:
                         end = (net_traces['pkt_dst'] == float(filter))
                         group = net_traces[packet_not_zero & start & end]
                         filtered_net_groups.append({'group': group,
-                                                    'color': 'rgba(%s,%s,%s,0.8)' %(randint(0,255),randint(0,255),randint(0,255)),
-                                                 'keyword': 'to_%s' %filter})
+                                                    'color': 'rgba(%s,%s,%s,0.8)' %(random.randint(0,255),random.randint(0,255),random.randint(0,255)),
+                                                    'keyword': 'to_%s' %filter})
 
                     end = (net_traces['pkt_dst'] == float(cfg.net_filters[0]))
                     for filter in cfg.net_filters[1:]:
                         start = (net_traces['pkt_src'] == float(filter))
                         group = net_traces[packet_not_zero & start & end]
                         filtered_net_groups.append({'group': group,
-                                                    'color': 'rgba(%s,%s,%s,0.8)' %(randint(0,255),randint(0,255),randint(0,255)),
+                                                    'color': 'rgba(%s,%s,%s,0.8)' %(random.randint(0,255),random.randint(0,255),random.randint(0,255)),
                                                     'keyword': 'from_%s' %filter})
     else:
         print_warning("no network traces were recorded.")
-
+    # ============ Preprocessing Network Bandwidth Trace ============
+    with open('%s/netstat.txt' % logdir) as f:
+        lines = f.readlines()
+        if lines:
+            tmp_time = float(lines[0].split(',')[0])
+            tmp_tx = int(lines[0].split(',')[1])
+            tmp_rx = int(lines[0].split(',')[2])
+            all_time = []
+            all_tx = []
+            all_rx = []
+            tx_list = []
+            rx_list = []
+            bandwidth_result = pd.DataFrame([], columns=['time', 'tx_bandwidth', 'rx_bandwidth'])
+    
+            for line in lines[1:]:
+                time = float(line.split(',')[0])
+                tx = int(line.split(',')[1])
+                rx = int(line.split(',')[2])
+                tx_bandwidth = (tx - tmp_tx) / (time - tmp_time) 
+                rx_bandwidth = (rx - tmp_rx) / (time - tmp_time)
+                
+                #sofa_fieldnames = [
+                #    "timestamp",  # 0
+                #    "event",  # 1
+                #    "duration",  # 2
+                #    "deviceId",  # 3
+                #    "copyKind",  # 4
+                #    "payload",  # 5
+                #    "bandwidth",  # 6
+                #    "pkt_src",  # 7
+                #    "pkt_dst",  # 8
+                #    "pid",  # 9
+                #    "tid",  # 10
+                #    "name",  # 11
+                #    "category"] # 12
+                
+                t_begin = time
+                if not cfg.absolute_timestamp:
+                    t_begin = t_begin - cfg.time_base
+    
+                trace = [ 
+                    t_begin, # timestamp
+                    0, # event
+                    -1,
+                    -1,
+                    -1,
+                    -1,
+                    tx_bandwidth, # tx bandwidth
+                    -1,
+                    -1,
+                    -1,
+                    -1,
+                    "network_bandwidth_tx(bytes):%d" % tx_bandwidth,
+                    0
+                    ]
+                tx_list.append(trace)
+    
+                trace = [
+                    t_begin, # timestamp
+                    1, # event
+                    -1,
+                    -1,
+                    -1,
+                    -1,
+                    rx_bandwidth, # rx bandwidth
+                    -1,
+                    -1,
+                    -1,
+                    -1,
+                    "network_bandwidth_rx(bytes):%d" % rx_bandwidth,
+                    0
+                    ]
+                rx_list.append(trace)
+    
+                # for visualize
+                all_time.append(time)
+                all_tx.append(tx_bandwidth)
+                all_rx.append(rx_bandwidth)
+            
+            # for pandas
+            result = [t_begin, tx_bandwidth, rx_bandwidth]
+            tmp_bandwidth_result = pd.DataFrame([result], columns=['time', 'tx_bandwidth', 'rx_bandwidth'])
+            bandwidth_result = pd.concat([bandwidth_result, tmp_bandwidth_result], ignore_index=True)
+            bandwidth_result.to_csv('%s/netbandwidth.csv' %logdir, header=True)
+            # prepare for next round loop        
+            tmp_time = time
+            tmp_tx = tx
+            tmp_rx = rx    
+            tx_traces = pd.DataFrame(tx_list, columns = sofa_fieldnames)
+            tx_traces.to_csv(
+                        logdir + 'netstat.csv',
+                        mode='w',
+                        header=True,
+                        index=False,
+                        float_format='%.6f')
+            rx_traces = pd.DataFrame(rx_list, columns = sofa_fieldnames)
+            rx_traces.to_csv(
+                        logdir + 'netstat.csv',
+                        mode='a',
+                        header=False,
+                        index=False,
+                        float_format='%.6f')
+        
     # ============ Preprocessing GPU Trace ==========================
     num_cudaproc = 0
     filtered_gpu_groups = []
@@ -891,27 +1298,27 @@ def sofa_preprocess(logdir, cfg):
         try:
             t_glb_gpu_bases.append( (pd.read_sql_table('CUPTI_ACTIVITY_KIND_MEMSET',engine)).iloc[0]['start'])
         except BaseException:
-            print_info('NO MEMSET')
+            print_info(cfg,'NO MEMSET')
         try:
             t_glb_gpu_bases.append( (pd.read_sql_table('CUPTI_ACTIVITY_KIND_MEMCPY',engine)).iloc[0]['start'])
         except BaseException:
-            print_info('NO MEMCPY')
-        try: 
+            print_info(cfg,'NO MEMCPY')
+        try:
             t_glb_gpu_bases.append( (pd.read_sql_table('CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL',engine)).iloc[0]['start'])
         except BaseException:
-            print_info('NO CONCURRENT KERNEL')
-        try: 
+            print_info(cfg,'NO CONCURRENT KERNEL')
+        try:
             t_glb_gpu_bases.append( (pd.read_sql_table('CUPTI_ACTIVITY_KIND_KERNEL',engine)).iloc[0]['start'])
         except BaseException:
-            print_info('NO KERNEL')
-        print(t_glb_gpu_bases)
-        if len(t_glb_gpu_bases) > 0: 
+            print_info(cfg,'NO KERNEL')
+        
+        if len(t_glb_gpu_bases) > 0:
             t_glb_gpu_base = sorted(t_glb_gpu_bases)[0]*1.0/1e+9
         else:
-           print_warning("There is no data in tables of NVVP file.") 
+           print_warning("There is no data in tables of NVVP file.")
 
-        print_info("Timestamp of the first GPU trace = " + str(t_glb_gpu_base))
-       
+        print_info(cfg,"Timestamp of the first GPU trace = " + str(t_glb_gpu_base))
+
         print_progress("Read " + nvvp_filename + " by nvprof -- end")
         num_cudaproc = num_cudaproc + 1
         with open(logdir + 'gputrace.tmp') as f:
@@ -922,7 +1329,6 @@ def sofa_preprocess(logdir, cfg):
                 indices = records[1].replace(
                     '"', '').replace(
                     '\n', '').split(',')
-                print(indices)
                 # ms,ms,,,,,,,,B,B,MB,GB/s,,,,
                 payload_unit = 1
                 if records[2].split(',')[11] == 'GB':
@@ -933,10 +1339,10 @@ def sofa_preprocess(logdir, cfg):
                     payload_unit = np.power(1024,1)
                 elif records[2].split(',')[11] == 'B':
                     payload_unit = 1
-                else: 
-                    print_info("The payload unit in gputrace.tmp was not recognized!")
-                    quit()
-                
+                else:
+                    print_info(cfg,"The payload unit in gputrace.tmp was not recognized!")
+                    sys.exit(1)
+
                 ts_rescale = 1.0
                 if records[2].split(',')[0] == 'ms':
                     ts_rescale = 1.0e3
@@ -950,12 +1356,13 @@ def sofa_preprocess(logdir, cfg):
                     dt_rescale = 1.0e6
 
                 records = records[3:]
-                print_info("Length of gpu_traces = %d" % len(records))
+                print_info(cfg,"Length of gpu_traces = %d" % len(records))
                 t_base = float(records[0].split(',')[0])
                 with mp.Pool(processes=cpu_count) as pool:
                     res = pool.map(
                         partial(
                             gpu_trace_read,
+                            cfg=cfg,
                             indices=indices,
                             ts_rescale=ts_rescale,
                             dt_rescale=dt_rescale,
@@ -988,7 +1395,7 @@ def sofa_preprocess(logdir, cfg):
                 print_warning(
                     "gputrace existed, but no kernel traces were recorded.")
                 os.system('cat %s/gputrace.tmp' % logdir)
- 
+
     # ============ Preprocessing GPU API Trace ==========================
     if cfg.cuda_api_tracing:
         num_cudaproc = 0
@@ -1000,21 +1407,21 @@ def sofa_preprocess(logdir, cfg):
 
             #Automatically retrieve the timestamp of the first CUDA activity(e.g. kernel, memory op, etc..)
             engine = create_engine("sqlite:///"+nvvp_filename)
-            t_glb_gpu_bases = []
+            t_glb_gpu_bases = []    
             first_corid = 1
             try:
                 t_glb_gpu_bases.append((pd.read_sql_table('CUPTI_ACTIVITY_KIND_RUNTIME',engine)).iloc[0]['start'])
                 first_corid = (pd.read_sql_table('CUPTI_ACTIVITY_KIND_RUNTIME',engine)).iloc[0]['correlationId']
             except BaseException:
-                print_info('NO RUNTIME')
+                print_info(cfg,'NO RUNTIME')
 
-            if len(t_glb_gpu_bases) > 0: 
+            if len(t_glb_gpu_bases) > 0:
                 t_glb_gpu_base = sorted(t_glb_gpu_bases)[0]*1.0/1e+9
             else:
-               print_warning("There is no data in tables of NVVP file.") 
+               print_warning("There is no data in tables of NVVP file.")
 
-            print_info("Timestamp of the first CUDA API trace = " + str(t_glb_gpu_base))
-           
+            print_info(cfg,"Timestamp of the first CUDA API trace = " + str(t_glb_gpu_base))
+
             print_progress("Read " + nvvp_filename + " by nvprof -- end")
             num_cudaproc = num_cudaproc + 1
             with open(logdir + 'cuda_api_trace.tmp') as f:
@@ -1024,8 +1431,7 @@ def sofa_preprocess(logdir, cfg):
                     indices = records[1].replace(
                         '"', '').replace(
                         '\n', '').split(',')
-                    print(indices)
-                    
+
                     ts_rescale = 1.0
                     if records[2].split(',')[0] == 'ms':
                         ts_rescale = 1.0e3
@@ -1039,22 +1445,23 @@ def sofa_preprocess(logdir, cfg):
                         dt_rescale = 1.0e6
 
                     records = records[3:]
-                    print_info("Length of cuda_api_traces = %d" % len(records))
-                   
-                    #TODO: Apply parallel search to speed up  
+                    print_info(cfg,"Length of cuda_api_traces = %d" % len(records))
+
+                    #TODO: Apply parallel search to speed up
                     t_base = float(records[0].split(',')[0])
-                    if len(records[0].split(',')) == 4: 
+                    if len(records[0].split(',')) == 4:
                         for record in records:
                             if int(record.split(',')[3]) == first_corid:
-                                t_base = float(record.split(',')[0]) 
-                                print_info('First Correlation_ID ' + str(first_corid) + ' is found in cuda_api_trace.tmp')
-                                print_info('First API trace timestamp is ' + str(t_base))
-                                break 
-                    
+                                t_base = float(record.split(',')[0])
+                                print_info(cfg,'First Correlation_ID ' + str(first_corid) + ' is found in cuda_api_trace.tmp')
+                                print_info(cfg,'First API trace timestamp is ' + str(t_base))
+                                break
+
                     with mp.Pool(processes=cpu_count) as pool:
                         res = pool.map(
                             partial(
                                 cuda_api_trace_read,
+                                cfg=cfg,
                                 indices=indices,
                                 ts_rescale=ts_rescale,
                                 dt_rescale=dt_rescale,
@@ -1075,9 +1482,15 @@ def sofa_preprocess(logdir, cfg):
                         header=True,
                         index=False,
                         float_format='%.6f')
-    
+
     # ============ Preprocessing CPU Trace ==========================
-    
+    with open(logdir+'perf_events_used.txt','r') as f:
+        lines = f.readlines()
+        if lines:
+            cfg.perf_events = lines[0]
+        else:
+            cfg.perf_events = ''
+        print_info(cfg,'perf_events_used: %s' % (cfg.perf_events))
     # Determine time base for perf traces
     perf_timebase_uptime = 0
     perf_timebase_unix = 0
@@ -1089,114 +1502,238 @@ def sofa_preprocess(logdir, cfg):
         try:
             last_nvvp_tss.append( (pd.read_sql_table('CUPTI_ACTIVITY_KIND_MEMSET',engine)).iloc[-1]['start'])
         except BaseException:
-            print_info('NO MEMSET')
-        
+            print_info(cfg,'NO MEMSET')
+
         try:
             last_nvvp_tss.append( (pd.read_sql_table('CUPTI_ACTIVITY_KIND_MEMCPY',engine)).iloc[-1]['start'])
         except BaseException:
-            print_info('NO MEMCPY')
-        
-        try: 
+            print_info(cfg,'NO MEMCPY')
+
+        try:
             last_nvvp_tss.append( (pd.read_sql_table('CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL',engine)).iloc[-1]['start'])
         except BaseException:
-            print_info('NO CONCURRENT KERNEL')
-        
-        try: 
+            print_info(cfg,'NO CONCURRENT KERNEL')
+
+        try:
             last_nvvp_tss.append( (pd.read_sql_table('CUPTI_ACTIVITY_KIND_KERNEL',engine)).iloc[-1]['start'])
         except BaseException:
-            print_info('NO KERNEL')
-        if len(last_nvvp_tss) > 0: 
+            print_info(cfg,'NO KERNEL')
+        if len(last_nvvp_tss) > 0:
             last_nvvp_ts = sorted(last_nvvp_tss,reverse=True)[0]*1.0/1e+9
         else:
-           print_warning("There is no data in tables of NVVP file.") 
-        
-        with open(logdir + 'cuhello.perf.script', 'w') as logfile:
-            subprocess.call(['perf',
-                     'script',
-                     '--kallsym',
-                     '%s/kallsyms' % logdir,
-                     '-i',
-                     '%s/cuhello.perf.data' % logdir,
-                     '-F',
-                     'time,pid,tid,event,ip,sym,dso,symoff,period,brstack,brstacksym'],
-                    stdout=logfile)
+           print_warning("There is no data in tables of NVVP file.")
 
-        with open(logdir + 'cuhello.perf.script') as f:
-            samples = f.readlines()
-            print_info("Length of cpu_traces = %d" % len(samples))
-            if len(samples) > 0:
-                for sample in reversed(samples):
-                    fields = sample.split()
-                    function_name = "" 
-                    if re.match('\[\d+\]', fields[1]) is not None:
-                        function_name = '[%s]'%fields[4].replace('-','_') + fields[6] + fields[7] 
-                    else:
-                        function_name = '[%s]'%fields[3].replace('-','_')  + fields[5] + fields[6] 
+        if int(os.system('command -v perf 1> /dev/null')) == 0:
+            with open(logdir + 'cuhello.perf.script', 'w') as logfile:
+                subprocess.call(['perf',
+                         'script',
+                         '--kallsym',
+                         '%s/kallsyms' % logdir,
+                         '-i',
+                         '%s/cuhello.perf.data' % logdir,
+                         '-F',
+                         'time,pid,tid,event,ip,sym,dso,symoff,period,brstack,brstacksym'],
+                        stdout=logfile)
 
-                    if function_name.find('libcuda.so') != -1 and len(last_nvvp_tss)>0: 
-                        perf_timebase_uptime = float(sample.split()[1].split(':')[0])
-                        perf_timebase_unix = last_nvvp_ts 
-                        break
+        try: 
+            with open(logdir + 'cuhello.perf.script') as f:
+                samples = f.readlines()
+                print_info(cfg,"Length of cpu_traces = %d" % len(samples))
+                if len(samples) > 0:
+                    for sample in reversed(samples):
+                        fields = sample.split()
+                        function_name = ""
+                        if re.match('\[\d+\]', fields[1]) is not None:
+                            function_name = '[%s]'%fields[4].replace('-','_') + fields[6] + fields[7]
+                        else:
+                            function_name = '[%s]'%fields[3].replace('-','_')  + fields[5] + fields[6]
+
+                        if function_name.find('libcuda.so') != -1 and len(last_nvvp_tss)>0:
+                            perf_timebase_uptime = float(sample.split()[1].split(':')[0])
+                            perf_timebase_unix = last_nvvp_ts
+                            break
+        except:
+            print_warning('no cuhello.perf.script, timestamp synchronization between CPU/GPU may not be precise enough.') 
         print_progress("Read " + nvvp_filename + " by nvprof -- end")
+
+    # STRACE Preprocessing
+    #CASE1: strace: Process 8361 attached
+    #CASE2: 1550311783.488821 mmap(NULL, 262144, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f501f910000 <0.000012>
+    #CASE3: [pid  8372] 1550311820.640979 +++ exited with 0 +++
+    total_strace_duration = 0
+    filter_keys = []
+    #filter_keys.append('futex')
+    filter_keys.append('resume')
+    filter_keys.append('nanosleep')
+    filter_keys.append('clock_gettime')
+    filter_keys.append('brk')
+    filter_keys.append('stat')
+    filter_keys.append('close')
+    filter_keys.append('exited')
+    filter_keys.append('access')
+    filter_keys.append('lseek')
+    filter_keys.append('getrusage')
+    filter_keys.append('exited')
+    if os.path.isfile('%s/strace.txt' % logdir):
+        with open('%s/strace.txt' % logdir) as f:
+            lines = f.readlines()
+            print_info(cfg,"Length of straces = %d" % len(lines))
+            if len(lines) > 1:
+                strace_list = []
+                strace_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())               
+                for i in range(len(lines)):
+                    if i % cfg.plot_ratio > 0:
+                        continue
+                    pid = cfg.pid
+                    tid = 0
+                    
+                    b_skip = False
+                    for key in filter_keys:
+                        if lines[i].find(key) != -1:
+                            b_skip = True
+                    if b_skip:
+                        continue
+
+                    fields = lines[i].split()
+                    if fields[0].find('pid') != -1 :
+                        tid = int(fields[1].split(']')[0])
+                        t_begin = float(fields[2])
+                        strace_info = ''.join(fields[3:-3])
+                    else:
+                        tid = pid
+                        t_begin = float(fields[1])
+                        strace_info = ''.join(fields[1:-3])
+                    
+                    if not cfg.absolute_timestamp:
+                        t_begin = t_begin - cfg.time_base
+                    
+                    #strace_info = strace_info.split('(')[0] 
+                    try:
+                        duration = float(fields[-1].split('<')[1].split('>')[0]) 
+                    except:
+                        duration = 0 
+                    total_strace_duration = total_strace_duration + duration
+
+                    if duration < cfg.strace_min_time:
+                        continue
+
+                    deviceId = -1
+                    event = -1
+                    copyKind = -1
+                    payload = -1
+                    bandwidth = -1
+                    pkt_src = pkt_dst = -1
+                    trace = [
+                        t_begin,
+                        event,
+                        duration,
+                        deviceId,
+                        copyKind,
+                        payload,
+                        bandwidth,
+                        pkt_src,
+                        pkt_dst,
+                        pid,
+                        tid,
+                        strace_info,
+                        cpuid]
+                    strace_list.append(trace)
+                
+                print_info(cfg, 'strace.txt reading is done.')
+                if len(strace_list)>1:
+                    strace_traces = list_to_csv_and_traces(logdir, strace_list, 'strace.csv', 'w')
+    print_info(cfg,'Total strace duration: %.3lf' % total_strace_duration)
+
+
+    # Pystacks Preprocessing
+
+    def parse_pystacks(filepath, ignore_idle=False):
+        ret = {}
+        with open(filepath, 'r') as f:
+            for ts, fs in itertools.zip_longest(*[f] * 2):
+                fs = fs.replace('\n', '').replace(';', '<br>')
+                if ignore_idle:
+                    if fs.find('idle') != -1:
+                        continue
+                    ret[int(ts) / 10 ** 6] = fs
+        duration = {}
+        prev = None
+        for k, val in ret.items():
+            if prev is None:
+                prev = k
+                continue
+            duration[prev] = k - prev
+            prev = k
+        del ret[max(ret.keys())]
+
+        return ret, duration
+
+    if os.path.isfile('{}/pystacks.txt'.format(logdir)):
+        fstack, dur = parse_pystacks('{}/pystacks.txt'.format(logdir), ignore_idle=True)
+        pystacks_list = []
+
+        if fstack:
+            for key, info in fstack.items():
+                deviceId = -1
+                event = -1
+                copyKind = -1
+                payload = -1
+                bandwidth = -1
+                pkt_src = pkt_dst = -1
+                pid = tid = -1
+                t_begin = key if cfg.absolute_timestamp else key - cfg.time_base
+                trace = [
+                    t_begin,
+                    event,
+                    float(dur[key]),
+                    deviceId,
+                    copyKind,
+                    payload,
+                    bandwidth,
+                    pkt_src,
+                    pkt_dst,
+                    pid,
+                    tid,
+                    info,
+                    cpuid
+                ]
+                pystacks_list.append(trace)
+        if pystacks_list:
+            pystacks_traces = list_to_csv_and_traces(logdir, pystacks_list, 'pystacks.csv', 'w')    
+
     
+    
+    # Time synchronization among BIOS Time (e.g. used by perf)  and NTP Time (e.g. NVPROF, tcpdump, etc.)
     if perf_timebase_unix == 0:
         with open(logdir + 'perf_timebase.txt') as f:
             lines = f.readlines()
-            perf_timebase_uptime = float(lines[-2].split()[2].split(':')[0])
-            perf_timebase_unix = float(lines[-1].split()[0])
-    
-    with open(logdir + 'perf.script') as f:
-        samples = f.readlines()
-        print_info("Length of cpu_traces = %d" % len(samples))
-        if len(samples) > 0:
-            with mp.Pool(processes=cpu_count) as pool:
-                res = pool.map(
-                    partial(
-                        cpu_trace_read,
-                        t_offset = perf_timebase_unix - perf_timebase_uptime),
-                    samples)
-            cpu_traces = pd.DataFrame(res)                      
-            cpu_traces.to_csv(
-                logdir + 'cputrace.csv',
-                mode='w',
-                header=True,
-                index=False,
-                float_format='%.6f')
-            res_viz = list_downsample(res, cfg.plot_ratio)
-            cpu_traces_viz = pd.DataFrame(res_viz)                
-            cpu_traces_viz.columns = sofa_fieldnames
-            char1 = ']'
-            char2 = '+'
-            # demangle c++ symbol, little dirty work here...
-            cpu_traces_viz['name'] = cpu_traces_viz['name'].apply(
-                lambda x: cxxfilt.demangle(str( x[x.find(char1)+1 : x.find(char2)].split('@')[0] ))
-            )            
-        ###  Apply filters for cpu traces
-        filtered_groups = []
-        if len(cpu_traces) > 0:
-            df_grouped = cpu_traces_viz.groupby('name')
-            for filter in cfg.cpu_filters:
-                group = cpu_traces_viz[cpu_traces_viz['name'].str.contains(
-                    filter.keyword)]
-                filtered_groups.append({'group': group,
-                                        'color': filter.color,
-                                        'keyword': filter.keyword})
-    ### hierarchical swarm generation
-    if cfg.enable_hsg:
-        with open(logdir + 'perf.script') as f, warnings.catch_warnings():
-            warnings.filterwarnings("ignore")
+            if len(lines) <= 3:
+                print_warning('Recorded progrom is too short.')
+                perf_timebase_uptime = 0 
+                perf_timebase_unix = 0 
+            elif lines[0].find('WARNING') != -1:
+                perf_timebase_uptime = 0 
+                perf_timebase_unix = 0 
+            else:
+                perf_timebase_uptime = float(lines[-2].split()[2].split(':')[0])
+                perf_timebase_unix = float(lines[-1].split()[0])
+
+    try:
+        with open(logdir + 'perf.script') as f:
             samples = f.readlines()
-            print_info("Length of cpu_traces = %d" % len(samples))
+            print_info(cfg,"Length of cpu_traces = %d" % len(samples))
             if len(samples) > 0:
                 with mp.Pool(processes=cpu_count) as pool:
                     res = pool.map(
                         partial(
-                            cpu_trace_read_hsg,
-                            t_offset = perf_timebase_unix - perf_timebase_uptime),
-                        samples)                
-                cpu_traces = pd.DataFrame(res)      
-                sofa_fieldnames_ext = sofa_fieldnames + ["feature_types"]
-                cpu_traces.columns = sofa_fieldnames_ext          
+                            cpu_trace_read,
+                            cfg = cfg,
+                            t_offset = perf_timebase_unix - perf_timebase_uptime,
+                            cpu_mhz_xp = cpu_mhz_xp,
+	    		cpu_mhz_fp = cpu_mhz_fp),
+                        samples)
+                cpu_traces = pd.DataFrame(res)
+                cpu_traces.columns = sofa_fieldnames
                 cpu_traces.to_csv(
                     logdir + 'cputrace.csv',
                     mode='w',
@@ -1204,128 +1741,42 @@ def sofa_preprocess(logdir, cfg):
                     index=False,
                     float_format='%.6f')
                 res_viz = list_downsample(res, cfg.plot_ratio)
-                swarm_cpu_traces_viz = pd.DataFrame(res_viz)
-                swarm_cpu_traces_viz.columns = sofa_fieldnames_ext        
-               
+                cpu_traces_viz = pd.DataFrame(res_viz)
+                cpu_traces_viz.columns = sofa_fieldnames
                 char1 = ']'
-                char2 = '+'      
+                char2 = '+'
                 # demangle c++ symbol, little dirty work here...
-                swarm_cpu_traces_viz['name'] = swarm_cpu_traces_viz['name'].apply(
+                cpu_traces_viz['name'] = cpu_traces_viz['name'].apply(
                     lambda x: cxxfilt.demangle(str( x[x.find(char1)+1 : x.find(char2)].split('@')[0] ))
                 )
-
-                ### N features ###
-                ## give unique id of each data within 10 msec by time quotient
-                swarm_cpu_traces_viz['quotient'] = swarm_cpu_traces_viz['timestamp'].apply(lambda x: int( x * 1000 // 10)) # //: quotient
-
-                # count feature_types in each 10 msec groups, and create a dictionary for mapping
-                df2s = {}
-                for quotient, dataframe in swarm_cpu_traces_viz.groupby(['quotient','event']):
-                    # api value_counts(): return pandas series
-                    df2s[quotient] = dataframe.feature_types.value_counts()
-                df2 = pd.DataFrame.from_dict(df2s, orient='index').fillna(0).astype(np.int64)
-
-                df = swarm_cpu_traces_viz.copy()
-                swarm_cpu_traces_viz = pd.merge(df, df2, left_on=['quotient','event'], right_index=True).copy()                
-
-            ### swarm seperation by memory location 
-            swarm_groups = []        
-            feature_list = ['event']
-            if cfg.hsg_multifeatures:
-                with open(logdir+'perf_events_used.txt','r') as f:
-                    lines = f.readlines()
-                    feature_list.extend(lines[0].split(',')) 
-                try:
-                    feature_list.remove('cycles')
-                    feature_list.remove('event')
-                except:
-                    pass
-           
-            print_info('HSG features: '+','.join(feature_list))
-            
-            idx = 0
-            showing_idx = 0
-
-            if len(cpu_traces) > 0:            
-                # get memory index by cheange float to integer
-                swarm_cpu_traces_viz['event_int'] = swarm_cpu_traces_viz.event.apply(lambda x: int(x)) # add new column 'event_int'            
-                # swarm seperate
-                event_groups = swarm_cpu_traces_viz.groupby('event_int')
-                swarm_stats = []
-                # add different swarm groups                        
-                for mem_index, l1_group in event_groups:                                
-                    # kmeans 
-                    X = pd.DataFrame(l1_group['event'])                                
-                    num_of_cluster = 2
-                    y_pred = kmeans_cluster(num_of_cluster, X)
-
-                    # add new column
-                    # TODO: Eliminate warning of SettingWithCopyWarning 
-                    l1_group['cluster'] = y_pred
-                    #for i in range(len(y_pred)):
-                    #    group.loc[i, 'cluster'] = y_pred[i]
-                    
-                    # group by new column
-                    clusters = l1_group.groupby('cluster')
-                                    
-                    for l2_group_idx, l2_group in clusters:                       
-                        # group by process id
-                        #pid_clusters = cluster.groupby('pid')
-                        X = pd.DataFrame(l2_group['event'])                                
-                        num_of_cluster = 4
-                        y_pred = kmeans_cluster(num_of_cluster, X)
-
-                        # add new column 
-                        l2_group['cluster'] = y_pred                 
-                        #for i in range(len(y_pred)):
-                        #    l2_group.loc[i, 'cluster'] = y_pred[i]       
-                        
-                        # group by new column
-                        last_clusters = l2_group.groupby('cluster')
  
-                        for last_cluster_idx, last_cluster in last_clusters:                              
-                            # kmeans
-                            X = pd.DataFrame(last_cluster[feature_list])
-                            num_of_cluster = 4
-                            y_pred_pid_cluster = kmeans_cluster(num_of_cluster, X)
+            ###  Apply filters for cpu traces
+            filtered_groups = []
+            if len(cpu_traces) > 0:
+                df_grouped = cpu_traces_viz.groupby('name')
+                for filter in cfg.cpu_filters:
+                    group = cpu_traces_viz[cpu_traces_viz['name'].str.contains(
+                        filter.keyword)]
+                    filtered_groups.append({'group': group,
+                                            'color': filter.color,
+                                            'keyword': filter.keyword})
+            try:
+                swarm_stats = []
+                swarms = []
+                #swarms, swarm_stats = hsg_v1(cfg, cpu_traces, swarms, swarm_stats, perf_timebase_unix - perf_timebase_uptime, cpu_mhz_xp, cpu_mhz_fp) 
+                cpu_traces, swarms = hsg_v2(cfg, cpu_traces, export_file=cfg.logdir+'/swarms_report.txt') 
+            except TypeError:
+                print_warning('HSG returned a None object to swarms, check if sofalog/perf.data can be accessed.')
+                pass 
+    except:
+        print_warning('no perf traces.') 
 
-                            # add new column
-                            last_cluster['cluster_in_pid'] = y_pred_pid_cluster
-                            # group by new column
-                            cluster_in_pid_clusters = last_cluster.groupby('cluster_in_pid')
-
-                            for mini_cluster_id, cluster_in_pid_cluster in cluster_in_pid_clusters:                                  
-                                total_duration = cluster_in_pid_cluster.duration.sum()                            
-                                mean_duration = cluster_in_pid_cluster.duration.mean()                            
-                                swarm_stats.append({'keyword':'SWARM_' + str(idx) +  ('_' * showing_idx),
-                                                    'duration_sum': total_duration,
-                                                    'duration_mean': mean_duration,
-                                                    'example':cluster_in_pid_cluster.head(1)['name'].to_string().split('  ')[2] 
-                                                    }) 
-                                swarm_groups.append({'group': cluster_in_pid_cluster.drop(columns = ['event_int', 'cluster', 'cluster_in_pid']), # data of each group
-                                                    'color':  random_generate_color(),
-                                                    'keyword': 'SWARM_' + str(idx) +  ('_' * showing_idx), 
-                                                    'total_duration': total_duration})                                                    
-                                idx += 1
-                                            
-                swarm_groups.sort(key=itemgetter('total_duration'), reverse = True) # reverse = True: descending
-                print_title('HSG Statistics - Top-%d Swarms'%(cfg.num_swarms)) 
-                swarm_stats.sort(key=itemgetter('duration_sum'), reverse = True) # reverse = True: descending
-                for i in range(len(swarm_stats)):
-                    if i >= cfg.num_swarms:
-                        break
-                    else:
-                        swarm = swarm_stats[i]
-                        print('%s: execution_time(sum,mean): %.6lf(s),%.6lf(s)  caption: %s'%(swarm['keyword'],swarm['duration_sum']/4.0,swarm['duration_mean']/4.0,swarm['example']))
-
+         
     #=== Intel PCM Trace =======#
-    ### Skt,PCIeRdCur,RFO,CRd,DRd,ItoM,PRd,WiL,PCIe Rd (B),PCIe Wr (B)
-    ### 0,0,852,0,0,48,0,0,54528,57600
-    ### 1,0,600,0,0,0,0,0,38400,38400
     if cfg.enable_pcm and os.path.isfile('%s/pcm_pcie.csv' % logdir):
         with open( logdir + '/pcm_pcie.csv' ) as f:
             lines = f.readlines()
-            print_info("Length of pcm_pcie_traces = %d" % len(lines))
+            print_info(cfg,"Length of pcm_pcie_traces = %d" % len(lines))
             if len(lines) > 0:
                 pcm_pcie_list = []
                 pcm_pcie_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
@@ -1334,9 +1785,13 @@ def sofa_preprocess(logdir, cfg):
                         fields = line.split(',')
                         #for f in range(len(fields)):
                         #    print("field[%d] %s" % (f, fields[f]))
-                       
+
                         skt = int(fields[1])
-                        t_begin = float(fields[0]) 
+                        t_begin = float(fields[0])
+
+                        if not cfg.absolute_timestamp:
+                            t_begin = t_begin - cfg.time_base
+
                         deviceId = skt
                         event = -1
                         copyKind = -1
@@ -1364,7 +1819,7 @@ def sofa_preprocess(logdir, cfg):
                             pcm_pcie_info,
                             cpuid]
                         pcm_pcie_list.append(trace)
- 
+
                         pcm_pcie_info = "PCM=pcie | skt=%d | WT=%d (KB)" % (
                             skt, pcm_pcie_wt_count)
                         bandwidth = pcm_pcie_wt_count
@@ -1382,39 +1837,45 @@ def sofa_preprocess(logdir, cfg):
                             tid,
                             pcm_pcie_info,
                             cpuid]
-                        pcm_pcie_list.append(trace)                 
+                        pcm_pcie_list.append(trace)
                 pcm_pcie_traces = list_to_csv_and_traces(logdir, pcm_pcie_list, 'pcm_pcie_trace.csv', 'w')
 
             else:
                 print_warning('No pcm-pcie counter values are recorded.')
                 print_warning('If necessary, run /usr/local/intelpcm/bin/pcm-pcie.x ONCE to reset MSR so as to enable correct pcm recording')
-   
+
     ### time, skt, iMC_Read, iMC_Write [, partial_write] [, EDC_Read, EDC_Write] , sysRead, sysWrite, sysTotal
     if cfg.enable_pcm and os.path.isfile('%s/pcm_memory.csv' % logdir):
         with open( logdir + '/pcm_memory.csv' ) as f:
             lines = f.readlines()
-            print_info("Length of pcm_memory_traces = %d" % len(lines))
+            print_info(cfg,"Length of pcm_memory_traces = %d" % len(lines))
             if len(lines) > 0:
                 pcm_memory_list = []
                 pcm_memory_list.append(np.empty((len(sofa_fieldnames), 0)).tolist())
                 for line in lines:
                     if line.find('Skt') == -1:
                         fields = line.split(',')
-                        #for f in range(len(fields)):
-                        #    print("field[%d] %s" % (f, fields[f]))
-                       
+
                         skt = int(fields[1])
-                        t_begin = float(fields[0]) 
+                        t_begin = float(fields[0])
                         deviceId = skt
                         event = -1
                         copyKind = -1
                         payload = -1
-                        pcm_memory_wt_count = int(float(fields[3]))
-                        pcm_memory_rd_count = int(float(fields[2]))
+                        try:
+                            pcm_memory_wt_count = int(float(fields[3]))
+                            pcm_memory_rd_count = int(float(fields[2]))
+                        except:
+                            pcm_memory_wt_count=0
+                            pcm_memory_rd_count=0
+
                         pkt_src = pkt_dst = -1
                         pid = tid = -1
                         pcm_memory_info = "PCM=memory | skt=%d | RD=%d (MB/s)" % (
                             skt, pcm_memory_rd_count)
+
+                        if not cfg.absolute_timestamp:
+                            t_begin = t_begin - cfg.time_base
 
                         bandwidth = pcm_memory_rd_count
                         trace = [
@@ -1432,7 +1893,7 @@ def sofa_preprocess(logdir, cfg):
                             pcm_memory_info,
                             cpuid]
                         pcm_memory_list.append(trace)
- 
+
                         pcm_memory_info = "PCM=memory | skt=%d | WT=%d (MB/s)" % (
                             skt, pcm_memory_wt_count)
                         bandwidth = pcm_memory_wt_count
@@ -1450,13 +1911,13 @@ def sofa_preprocess(logdir, cfg):
                             tid,
                             pcm_memory_info,
                             cpuid]
-                        pcm_memory_list.append(trace)                 
+                        pcm_memory_list.append(trace)
                 pcm_memory_traces = list_to_csv_and_traces(logdir, pcm_memory_list, 'pcm_memory_trace.csv', 'w')
 
             else:
                 print_warning('No pcm-memory counter values are recorded.')
                 print_warning('If necessary, run /usr/local/intelpcm/bin/pcm-memory.x ONCE to reset MSR so as to enable correct pcm recording')
-    
+
     print_progress(
         "Export Overhead Dynamics JSON File of CPU, Network and GPU traces -- begin")
 
@@ -1466,37 +1927,56 @@ def sofa_preprocess(logdir, cfg):
     # gpu_traces.loc[:,'timestamp'] -= gpu_traces.loc[0,'timestamp']
 
     traces = []
-    sofatrace = SOFATrace()
-    sofatrace.name = 'cpu_trace'
-    sofatrace.title = 'CPU'
-    sofatrace.color = 'DarkGray'
-    sofatrace.x_field = 'timestamp'
-    sofatrace.y_field = 'duration'
-    sofatrace.data = cpu_traces_viz
-    traces.append(sofatrace)
-
-    for filtered_group in filtered_groups:
+    
+    if len(cpu_traces_viz) > 0:
         sofatrace = SOFATrace()
-        sofatrace.name = filtered_group['keyword']
-        sofatrace.title = '[keyword]' + sofatrace.name
-        sofatrace.color = filtered_group['color']
+        sofatrace.name = 'cpu_trace'
+        sofatrace.title = 'CPU'
+        sofatrace.color = 'DarkGray'
         sofatrace.x_field = 'timestamp'
         sofatrace.y_field = 'duration'
-        sofatrace.data = filtered_group['group'].copy()
+        sofatrace.data = cpu_traces_viz
         traces.append(sofatrace)
 
-    if cfg.enable_hsg:
-        # top 10 cumulative time of a swarm
-        number_of_swarm = cfg.num_swarms                           
-        for swarm in swarm_groups[:number_of_swarm]: 
+        for filtered_group in filtered_groups:
             sofatrace = SOFATrace()
-            sofatrace.name = swarm['keyword']
-            sofatrace.title = swarm['keyword'] # add number of swarm
-            sofatrace.color = swarm['color']        
+            sofatrace.name = filtered_group['keyword']
+            sofatrace.title = '[keyword]' + sofatrace.name
+            sofatrace.color = filtered_group['color']
             sofatrace.x_field = 'timestamp'
-            sofatrace.y_field = 'duration'        
-            sofatrace.data = swarm['group'].copy()               
+            sofatrace.y_field = 'duration'
+            sofatrace.data = filtered_group['group'].copy()
             traces.append(sofatrace)
+ 
+        if len(swarms) > 0 :
+            traces = swarms_to_sofatrace(cfg, swarms, traces) # append data of hsg function
+
+    sofatrace = SOFATrace()
+    sofatrace.name = 'blktrace_starting_block'
+    sofatrace.title = 'BLKTRACE_STARTING_BLOCK'
+    sofatrace.color = 'Green'
+    sofatrace.x_field = 'timestamp'
+    sofatrace.y_field = 'duration'
+    sofatrace.data = blk_d_traces
+    traces.append(sofatrace)
+
+    sofatrace = SOFATrace()
+    sofatrace.name = 'blktrace_time'
+    sofatrace.title = 'BLKTRACE_TIME'
+    sofatrace.color = 'DodgerBlue'
+    sofatrace.x_field = 'timestamp'
+    sofatrace.y_field = 'duration'
+    sofatrace.data = blk_traces
+    traces.append(sofatrace)
+
+    sofatrace = SOFATrace()
+    sofatrace.name = 'vmstat_cs'
+    sofatrace.title = 'VMSTAT_CS'
+    sofatrace.color = 'Pink'
+    sofatrace.x_field = 'timestamp'
+    sofatrace.y_field = 'duration'
+    sofatrace.data = vm_cs_traces
+    traces.append(sofatrace)
 
     sofatrace = SOFATrace()
     sofatrace.name = 'vmstat_bi'
@@ -1515,7 +1995,28 @@ def sofa_preprocess(logdir, cfg):
     sofatrace.y_field = 'duration'
     sofatrace.data = vm_bo_traces
     traces.append(sofatrace)
-    
+
+    if cfg.enable_mpstat:
+        sofatrace = SOFATrace()
+        sofatrace.name = 'mpstat_usr'
+        sofatrace.title = 'MPSTAT_USR'
+        sofatrace.color = 'Cyan'
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'duration'
+        sofatrace.data = mpstat_traces
+        traces.append(sofatrace)
+
+    if cfg.enable_diskstat:
+        sofatrace = SOFATrace()
+        sofatrace.name = 'diskstat'
+        sofatrace.title = 'DISK_USAGE (MB/s)'
+        sofatrace.color = 'GreenYellow'
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'bandwidth'
+        sofatrace.data = diskstat_traces
+        traces.append(sofatrace)
+
+
     if cfg.enable_vmstat:
         sofatrace = SOFATrace()
         sofatrace.name = 'vmstat_usr'
@@ -1525,7 +2026,7 @@ def sofa_preprocess(logdir, cfg):
         sofatrace.y_field = 'duration'
         sofatrace.data = vm_usr_traces
         traces.append(sofatrace)
-    
+
         sofatrace = SOFATrace()
         sofatrace.name = 'vmstat_sys'
         sofatrace.title = 'CPU_USAGE_SYS'
@@ -1553,7 +2054,23 @@ def sofa_preprocess(logdir, cfg):
         sofatrace.data = vm_cs_traces
         traces.append(sofatrace)
 
-
+    sofatrace = SOFATrace()
+    sofatrace.name = 'strace'
+    sofatrace.title = 'STRACE.'
+    sofatrace.color = 'DarkSlateGray'
+    sofatrace.x_field = 'timestamp'
+    sofatrace.y_field = 'duration'
+    sofatrace.data = strace_traces
+    traces.append(sofatrace)
+    
+    sofatrace = SOFATrace()
+    sofatrace.name = 'pystacks'
+    sofatrace.title = 'Python-stacks.'
+    sofatrace.color = 'Tomato'
+    sofatrace.x_field = 'timestamp'
+    sofatrace.y_field = 'duration'
+    sofatrace.data = pystacks_traces
+    traces.append(sofatrace)
 
     sofatrace = SOFATrace()
     sofatrace.name = 'nvsmi_mem'
@@ -1572,6 +2089,80 @@ def sofa_preprocess(logdir, cfg):
     sofatrace.y_field = 'duration'
     sofatrace.data = nvsmi_sm_traces
     traces.append(sofatrace)
+    
+    if cfg.ds:
+        sofatrace = SOFATrace()
+        sofatrace.name = 'sock_send'
+        sofatrace.title = 'sock_sendmsg'
+        sofatrace.color = 'rgba(0, 120, 255, 0.8)'
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'deviceId'
+        sofatrace.data = ds_dds_traces[0]
+        traces.append(sofatrace)
+
+        sofatrace = SOFATrace()
+        sofatrace.name = 'sock_recv'
+        sofatrace.title = 'sock_recvmsg'
+        sofatrace.color = 'rgba(255, 33, 44, 0.8)'
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'deviceId'
+        sofatrace.data = ds_dds_traces[1]
+        traces.append(sofatrace)
+
+        sofatrace = SOFATrace()
+        sofatrace.name = 'sock_send_band'
+        sofatrace.title = 'send_bandwidth'
+        sofatrace.color = 'rgba(%s,%s,%s,0.8)' %(random.randint(0,255),random.randint(0,255),random.randint(0,255))
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'bandwidth'
+        sofatrace.data = ds_dds_traces[2]
+        traces.append(sofatrace)
+
+        sofatrace = SOFATrace()
+        sofatrace.name = 'sock_recv_band'
+        sofatrace.title = 'recv_bandwidth'
+        sofatrace.color = 'rgba(%s,%s,%s,0.8)' %(random.randint(0,255),random.randint(0,255),random.randint(0,255))
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'bandwidth'
+        sofatrace.data = ds_dds_traces[3]
+        traces.append(sofatrace)
+
+        sofatrace = SOFATrace()
+        sofatrace.name = 'dds_pub_sample'
+        sofatrace.title = 'dss_data_write'
+        sofatrace.color = 'rgba(%s,%s,%s,0.8)' %(random.randint(0,255),random.randint(0,255),random.randint(0,255))
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'event'
+        sofatrace.data = ds_dds_traces[4]
+        traces.append(sofatrace)
+ 
+        sofatrace = SOFATrace()
+        sofatrace.name = 'dss_sub_sample'
+        sofatrace.title = 'dss_data_read'
+        sofatrace.color = 'rgba(%s,%s,%s,0.8)' %(random.randint(0,255),random.randint(0,255),random.randint(0,255))
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'event'
+        sofatrace.data = ds_dds_traces[5]
+        traces.append(sofatrace)
+
+    if cfg.enable_encode_decode:
+        sofatrace = SOFATrace()
+        sofatrace.name = 'nvsmi_enc'
+        sofatrace.title = 'GPU_ENC_Util.'
+        sofatrace.color = 'rgba(255, 215, 0, 0.8)' #Gold
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'duration'
+        sofatrace.data = nvsmi_enc_traces
+        traces.append(sofatrace)
+
+        sofatrace = SOFATrace()
+        sofatrace.name = 'nvsmi_dec'
+        sofatrace.title = 'GPU_DEC_Util.'
+        sofatrace.color = 'rgba(218, 165, 32, 0.8)' #GoldenRod
+        sofatrace.x_field = 'timestamp'
+        sofatrace.y_field = 'duration'
+        sofatrace.data = nvsmi_dec_traces
+        traces.append(sofatrace)
 
     sofatrace = SOFATrace()
     sofatrace.name = 'pcm_pcie'
@@ -1599,7 +2190,7 @@ def sofa_preprocess(logdir, cfg):
     sofatrace.y_field = 'duration'
     sofatrace.data = net_traces
     traces.append(sofatrace)
-    
+
     if cfg.net_filters:
         for filtered_net_group in filtered_net_groups:
             sofatrace = SOFATrace()
@@ -1610,6 +2201,24 @@ def sofa_preprocess(logdir, cfg):
             sofatrace.y_field = 'duration'
             sofatrace.data = filtered_net_group['group'].copy()
             traces.append(sofatrace)
+
+    sofatrace = SOFATrace()
+    sofatrace.name = 'tx_bandwidth'
+    sofatrace.title = 'tx Bandwidth'
+    sofatrace.color = 'rgba(135,206,250,0.8)' # LightSkyBlue
+    sofatrace.x_field = 'timestamp'
+    sofatrace.y_field = 'bandwidth'
+    sofatrace.data = tx_traces
+    traces.append(sofatrace)
+
+    sofatrace = SOFATrace()
+    sofatrace.name = 'rx_bandwidth'
+    sofatrace.title = 'rx Bandwidth'
+    sofatrace.color = 'rgba(25,25,112,0.8)' # MidnightBlue
+    sofatrace.x_field = 'timestamp'
+    sofatrace.y_field = 'bandwidth'
+    sofatrace.data = rx_traces
+    traces.append(sofatrace)
 
     sofatrace = SOFATrace()
     sofatrace.name = 'gpu_kernel_trace'
@@ -1640,6 +2249,7 @@ def sofa_preprocess(logdir, cfg):
         sofatrace.data = cuda_api_traces_viz
         traces.append(sofatrace)
 
-    traces_to_json(traces, logdir + 'report.js', cfg)
+    traces_to_json(traces, logdir + 'report.js', cfg, ds_pid)
+
     print_progress(
         "Export Overhead Dynamics JSON File of CPU, Network and GPU traces -- end")

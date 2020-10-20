@@ -6,7 +6,8 @@ C_NONE="\033[0;00m"
 C_RED="\033[1;31m"
 C_GREEN="\033[1;32m"
 
-INSTALL_DIRS=(bin
+INSTALL_DIRS=(bin/DDS
+              bin
               sofaboard
               plugins
               tools
@@ -21,10 +22,25 @@ BIN_FILES=(bin/sofa
            bin/sofa_config.py
            bin/sofa_print.py
            bin/sofa_common.py
-           sofa-pcm/pcm-core.x
-           sofa-pcm/pcm-numa.x
-           sofa-pcm/pcm-pcie.x
-           sofa-pcm/pcm-memory.x
+           bin/potato_pb2.py
+           bin/potato_pb2_grpc.py
+           bin/sofa_ml.py
+           bin/sofa_models.py
+           bin/DDS/bpf_ds_dds.py
+           bin/DDS/dds_calc_topic_latency.py
+           bin/DDS/dds_cfg_4_sofa.txt
+           bin/DDS/ds_create_viz.py
+           bin/DDS/sofa_ds.py 	
+           bin/DDS/sofa_ds_preprocess.py
+           bin/DDS/sofa_ds_timeadjust.py
+           bin/pcm-core.x
+           bin/pcm-numa.x
+           bin/pcm-pcie.x
+           bin/pcm-memory.x
+           bin/real_mono_diff
+           bin/sofa_aisi.py
+           bin/sofa_perf_timebase
+
            )
 PLUGIN_FILES=(plugins/.placeholder
               )
@@ -34,6 +50,11 @@ SOFABOARD_FILES=(sofaboard/index.html
                  sofaboard/comm-report.html
                  sofaboard/overhead.html
                  sofaboard/timeline.js
+                 sofaboard/potato_report.css
+                 sofaboard/net.html
+                 sofaboard/ds_nwconn.js
+                 sofaboard/ds_index_template
+                 sofaboard/connect_timeline.js
                  )
 
 print_help(){
@@ -53,7 +74,7 @@ function clear_install_dir()
     fi
     echo "Creating directories..."
     mkdir -p ${PREFIX}
-    mkdir -p ${PREFIX}/bin
+    mkdir -p ${PREFIX}/bin/DDS
     mkdir -p ${PREFIX}/sofaboard
     mkdir -p ${PREFIX}/plugins
     mkdir -p ${PREFIX}/tools
@@ -70,7 +91,7 @@ function install_sofa()
     cp -rf ${SCRIPT_PATH}/bin       ${PREFIX}
     cp -rf ${SCRIPT_PATH}/plugins   ${PREFIX}
     cp -rf ${SCRIPT_PATH}/sofaboard ${PREFIX}
-    cp -rf ${SCRIPT_PATH}/papi/src/build ${PREFIX}
+    #cp -rf ${SCRIPT_PATH}/papi/src/build ${PREFIX}
 
     # Create a new file for SOFA environment
 ################## heredoc style

@@ -34,6 +34,15 @@ Highcharts.chart('container', {
         backgroundColor: (Highcharts.theme && Highcharts.theme.legendBackgroundColor) || '#FFFFFF',
         borderWidth: 1
     },
+ //   annotations: [{
+ //       labelOptions: {
+//            allowOverlap: false,
+//            shape: 'connector'
+//
+ //       },
+//        labels: outlier
+//    }],
+annotations: outlier,
     plotOptions: {
         scatter: {
             marker: {
@@ -56,7 +65,8 @@ Highcharts.chart('container', {
                 headerFormat: '<b>Category: {series.name}</b><br>',
                 pointFormat: '[{point.x} s]  Y:{point.y}, Name: {point.name}'
             },
-            turboThreshold: 0 
+            turboThreshold: 0,            
+            boostThreshold:1 
 
         }
     },
