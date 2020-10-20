@@ -1003,7 +1003,11 @@ int kretprobe_sock_recvmsg(struct pt_regs *ctx)
 
 bpf = BPF(text=intrucode)
 
-LIBPATH="/home/hermes/workspace/opensplice/install/HDE/x86_64.linux-dev/lib/"
+f = open("dds_cfg_4_sofa.txt")
+LIBPATH = f.read().rstrip('\n')
+f.close()
+if LIBPATH[-1] != '/':
+    LIBPATH = LIBPATH + '/'
 
 # Topic information recording
 bpf.attach_uprobe(name="%slibdcpssac.so"%LIBPATH, sym="DDS_DomainParticipant_create_topic", fn_name="T_GetTopicName")
