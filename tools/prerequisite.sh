@@ -100,7 +100,7 @@ function install_packages()
 	    $WITH_SUDO apt-get install -y curl wget make gcc g++ cmake \
             linux-tools-common tcpdump sysstat \
             linux-tools-$(uname -r) linux-cloud-tools-$(uname -r) linux-tools-generic linux-cloud-tools-generic \
-            bpfcc-tools linux-headers-$(uname -r)
+            bpfcc-tools linux-headers-$(uname -r) ntp
 	    [[ $? != 0 ]] && echo -e "${C_RED_BK}Failed... :(${C_NONE}" && exit 1
     elif [[ $(which yum) ]]  ; then
         $WITH_SUDO yum install -y epel-release 
